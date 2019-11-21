@@ -1,5 +1,4 @@
 #from __future__ import print_function
-import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,84 +6,64 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.autograd import Variable
 import cv2
-import sys
 import numpy as np
 from skimage import segmentation
 import torch.nn.init
 
+import glob
+import os
+import random
+from itertools import count
+
+from options import args
+from model import MyNet
+
 use_cuda = torch.cuda.is_available()
+###############################################################################################
+###############################################################################################
 
-parser = argparse.ArgumentParser(description='PyTorch Unsupervised Segmentation')
-parser.add_argument('--nChannel', metavar='N', default=100, type=int, 
-                    help='number of channels')
-parser.add_argument('--maxIter', metavar='T', default=1000, type=int, 
-                    help='number of maximum iterations')
-parser.add_argument('--minLabels', metavar='minL', default=3, type=int, 
-                    help='minimum number of labels')
-parser.add_argument('--lr', metavar='LR', default=0.1, type=float, 
-                    help='learning rate')
-parser.add_argument('--nConv', metavar='M', default=2, type=int, 
-                    help='number of convolutional layers')
-parser.add_argument('--num_superpixels', metavar='K', default=10000, type=int, 
-                    help='number of superpixels')
-parser.add_argument('--compactness', metavar='C', default=100, type=float, 
-                    help='compactness of superpixels')
-parser.add_argument('--visualize', metavar='1 or 0', default=1, type=int, 
-                    help='visualization flag')
-parser.add_argument('--input', metavar='FILENAME',
-                    help='input image file name', required=True)
-args = parser.parse_args()
+def loadData():
+    files = glob.glob(os.path.join(args.training_dir,"*"))
+    f = random.sample(files,1)[0]
+    im = cv2.imread(f)
+    im = crop(im)
+    data = torch.from_numpy(im).float().permute(2,0,1) / 255.0
+    data = data.cuda().unsqueeze(0)
+    return im, Variable(data)
 
-# CNN model
-class MyNet(nn.Module):
-    def __init__(self,input_dim):
-        super(MyNet, self).__init__()
-        self.conv1 = nn.Conv2d(input_dim, args.nChannel, kernel_size=3, stride=1, padding=1 )
-        self.bn1 = nn.BatchNorm2d(args.nChannel)
-        self.conv2 = nn.ModuleList()
-        self.bn2 = nn.ModuleList()
-        for i in range(args.nConv-1):
-            self.conv2.append( nn.Conv2d(args.nChannel, args.nChannel, kernel_size=3, stride=1, padding=1 ) )
-            self.bn2.append( nn.BatchNorm2d(args.nChannel) )
-        self.conv3 = nn.Conv2d(args.nChannel, args.nChannel, kernel_size=1, stride=1, padding=0 )
-        self.bn3 = nn.BatchNorm2d(args.nChannel)
+def crop(img,width=128,height=128):
+    h,w,_ = img.shape
+    xpos = random.randint(0,w-width-1)
+    ypos = random.randint(0,h-height-1)
+    return img[ypos:ypos+height,xpos:xpos+width]
 
-    def forward(self, x):
-        x = self.conv1(x)
-        x = F.relu( x )
-        x = self.bn1(x)
-        for i in range(args.nConv-1):
-            x = self.conv2[i](x)
-            x = F.relu( x )
-            x = self.bn2[i](x)
-        x = self.conv3(x)
-        x = self.bn3(x)
-        return x
+def save(model,k):
+    data = {'model': model.state_dict()}
+    data['k'] = k
+    torch.save(data,'segnet.pth')
 
-# load image
-im = cv2.imread(args.input)
-data = torch.from_numpy( np.array([im.transpose( (2, 0, 1) ).astype('float32')/255.]) )
-if use_cuda:
-    data = data.cuda()
-data = Variable(data)
-
-# slic
-labels = segmentation.slic(im, compactness=args.compactness, n_segments=args.num_superpixels)
-labels = labels.reshape(im.shape[0]*im.shape[1])
-u_labels = np.unique(labels)
-l_inds = []
-for i in range(len(u_labels)):
-    l_inds.append( np.where( labels == u_labels[ i ] )[ 0 ] )
-
-# train
-model = MyNet( data.size(1) )
+# define model
+model = MyNet( 3 )
 if use_cuda:
     model.cuda()
 model.train()
 loss_fn = torch.nn.CrossEntropyLoss()
 optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
 label_colours = np.random.randint(255,size=(100,3))
-for batch_idx in range(args.maxIter):
+
+#for batch_idx in range(args.maxIter):
+for batch_idx in count():
+# load image
+    im,data = loadData()
+
+    # slic
+    labels = segmentation.slic(im, compactness=args.compactness, n_segments=args.num_superpixels)
+    labels = labels.reshape(im.shape[0]*im.shape[1])
+    u_labels = np.unique(labels)
+    l_inds = []
+    for i in range(len(u_labels)):
+        l_inds.append( np.where( labels == u_labels[ i ] )[ 0 ] )
+
     # forwarding
     optimizer.zero_grad()
     output = model( data )[ 0 ]
@@ -118,8 +97,14 @@ for batch_idx in range(args.maxIter):
     #print (batch_idx, '/', args.maxIter, ':', nLabels, loss.data[0])
     print (batch_idx, '/', args.maxIter, ':', nLabels, loss.item())
 
+    # save after every 800 iterations
+    if batch_idx % 800 == 0:
+        save(model, nLabels)
+
     if nLabels <= args.minLabels:
         print ("nLabels", nLabels, "reached minLabels", args.minLabels, ".")
+        save(model, nLabels)
+        print('model saved')
         break
 
 # save output image
@@ -130,4 +115,6 @@ if not args.visualize:
     im_target = target.data.cpu().numpy()
     im_target_rgb = np.array([label_colours[ c % 100 ] for c in im_target])
     im_target_rgb = im_target_rgb.reshape( im.shape ).astype( np.uint8 )
+
 cv2.imwrite( "output.png", im_target_rgb )
+
